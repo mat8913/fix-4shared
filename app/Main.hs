@@ -38,9 +38,9 @@ import qualified Data.ByteString.Lazy    as L
 import           Data.ByteString.Builder (toLazyByteString, integerDec)
 import qualified Data.ByteString.Base16  as Base16
 
-import           Data.Yaml     (decodeFileEither)
+import           Data.Yaml     (decodeFileEither, encode)
 import           Data.Aeson.TH (deriveJSON, defaultOptions)
-import           Data.Aeson    (FromJSON (parseJSON), (.:), withObject,
+import           Data.Aeson    (Value, FromJSON (parseJSON), (.:), withObject,
                                 eitherDecode')
 
 import qualified Crypto.Hash.MD5 as MD5
@@ -101,10 +101,30 @@ main = do
     args <- getArgs
     case args of
         [rootDir] -> app $ T.pack rootDir
+        []        -> showUserInfo
         _         -> fail "Invalid usage."
 
 app :: Text -> IO ()
 app rootDir = do
+    config <- getConfig
+    flip runReaderT config $ do
+        tmpFolder <- findFolder rootDir "tmp"
+        runConduit $ files tmpFolder
+                  .| awaitForever (\x -> do
+                                  dstId <- findCorrectDirId rootDir (pathName x)
+                                  move (pathId x) dstId)
+
+showUserInfo :: IO ()
+showUserInfo = do
+    config <- getConfig
+    flip runReaderT config $ do
+        x' <- user
+        case eitherDecode' x' of
+            Left e  -> fail e
+            Right x -> liftIO $ BS.putStr $ encode (x :: Value)
+
+getConfig :: IO IConfig
+getConfig = do
     Config {..} <- either throwIO pure =<< decodeFileEither "4shared.yaml"
     _manager <- getGlobalManager
     let _oauth = newOAuth { oauthConsumerKey = encodeUtf8 consumerKey
@@ -122,16 +142,10 @@ app rootDir = do
     hFlush stderr
     _ <- getLine
     _creds <- getAccessToken _oauth tempCreds _manager
-    let config = IConfig { manager = _manager
-                         , oauth = _oauth
-                         , creds = _creds
-                         }
-    flip runReaderT config $ do
-        tmpFolder <- findFolder rootDir "tmp"
-        runConduit $ files tmpFolder
-                  .| awaitForever (\x -> do
-                                  dstId <- findCorrectDirId rootDir (pathName x)
-                                  move (pathId x) dstId)
+    pure $ IConfig { manager = _manager
+                   , oauth = _oauth
+                   , creds = _creds
+                   }
 
 findFolder :: (MonadIO m, MonadReader IConfig m)
            => Text   -- ^ Directory ID to look in
@@ -144,6 +158,11 @@ findFolder dirId search = do
     case mx of
         Nothing -> fail $ "Couldn't find " ++ T.unpack search ++ " directory."
         Just x  -> pure $ pathId x
+
+user :: (MonadIO m, MonadReader IConfig m) => m L.ByteString
+user = fmap responseBody $ httpLbs $ baseRequest { method = "GET"
+                                                 , path = "/v1_2/user"
+                                                 }
 
 folders :: (MonadIO m, MonadReader IConfig m) => Text -> ConduitM i Path m ()
 folders dirId = folders' dirId .| parseFolders
